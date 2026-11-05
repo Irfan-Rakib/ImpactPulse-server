@@ -44,9 +44,11 @@ const app = express();
 
 const PORT = process.env.PORT || 5000;
 
-const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+const CLIENT_URL =
+  process.env.CLIENT_URL || "https://impact-pulse-one.vercel.app/";
 
-const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL || "http://localhost:3000";
+const BETTER_AUTH_URL =
+  process.env.BETTER_AUTH_URL || "https://impact-pulse-one.vercel.app/";
 
 app.use(
   cors({
@@ -364,7 +366,8 @@ async function authenticateUser(req, res, next) {
       if (!user) {
         return res.status(401).json({
           success: false,
-          message: "Your session token is invalid or expired. Please log in again.",
+          message:
+            "Your session token is invalid or expired. Please log in again.",
         });
       }
 
