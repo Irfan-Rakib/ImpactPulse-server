@@ -66,9 +66,9 @@ PORT=5000
 
 MONGODB_URI=your_mongodb_connection_string
 
-CLIENT_URL=http://localhost:3000
+CLIENT_URL=http://impact-pulse-one.vercel.app/
 
-BETTER_AUTH_URL=http://localhost:3000
+BETTER_AUTH_URL=http://impact-pulse-one.vercel.app/
 ```
 
 ### 3. Start the Server
@@ -80,7 +80,7 @@ npm run dev
 The API will run at:
 
 ```text
-http://localhost:5000
+http://https://impact-pulse-server.vercel.app/
 ```
 
 If `MONGODB_URI` is missing, the server stops immediately with an error. If the database connection fails, the process exits.

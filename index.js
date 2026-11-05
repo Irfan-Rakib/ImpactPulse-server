@@ -31,6 +31,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import crypto from "node:crypto";
 import { MongoClient, ObjectId } from "mongodb";
 
 dotenv.config();
@@ -129,20 +130,22 @@ function isValidHttpUrl(value) {
   }
 }
 
-function isEventDateInPast(date) {
-  if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return true;
-  }
-
-  // Compare calendar dates using Bangladesh local time.
-  const today = new Intl.DateTimeFormat("en-CA", {
+function getTodayDateString() {
+  // Calendar date in Bangladesh local time (YYYY-MM-DD).
+  return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Dhaka",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
+}
 
-  return date < today;
+function isEventDateInPast(date) {
+  if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return true;
+  }
+
+  return date < getTodayDateString();
 }
 
 function validateEventData(data) {
@@ -170,12 +173,14 @@ function validateEventData(data) {
     return "Description must contain at least 20 characters.";
   }
 
+  // Keep in sync with EVENT_TYPES in the client's src/lib/constants.ts.
   const allowedCategories = [
+    "Cleanup",
+    "Plantation",
+    "Donation",
     "Education",
-    "Environment",
-    "Food",
     "Health",
-    "Clothing",
+    "Food",
     "Community",
     "Other",
   ];
@@ -226,11 +231,148 @@ function getEventPayload(data) {
 }
 
 // ==========================================
-// 4. BETTER AUTH SESSION MIDDLEWARE
+// 4. AUTHENTICATION
+// Verifies a Better Auth JWT (Bearer) first,
+// then falls back to the shared session cookie.
 // ==========================================
+
+const JWKS_TTL_MS = 10 * 60 * 1000;
+
+let jwksCache = {
+  keys: [],
+  fetchedAt: 0,
+};
+
+function base64UrlToBuffer(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(normalized, "base64");
+}
+
+function decodeJwtPart(part) {
+  return JSON.parse(base64UrlToBuffer(part).toString("utf8"));
+}
+
+async function getJwks() {
+  const now = Date.now();
+
+  if (jwksCache.keys.length > 0 && now - jwksCache.fetchedAt < JWKS_TTL_MS) {
+    return jwksCache.keys;
+  }
+
+  const response = await fetch(`${BETTER_AUTH_URL}/api/auth/jwks`, {
+    headers: { accept: "application/json" },
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`Unable to fetch JWKS (status ${response.status}).`);
+  }
+
+  const data = await response.json();
+  const keys = Array.isArray(data?.keys) ? data.keys : [];
+
+  jwksCache = { keys, fetchedAt: now };
+
+  return keys;
+}
+
+async function verifyJwtToken(token) {
+  const parts = token.split(".");
+
+  if (parts.length !== 3) return null;
+
+  let header;
+  let payload;
+
+  try {
+    header = decodeJwtPart(parts[0]);
+    payload = decodeJwtPart(parts[1]);
+  } catch {
+    return null;
+  }
+
+  const keys = await getJwks();
+  const jwk = keys.find((key) => key.kid === header.kid) || keys[0];
+
+  if (!jwk) return null;
+
+  let publicKey;
+
+  try {
+    publicKey = crypto.createPublicKey({ key: jwk, format: "jwk" });
+  } catch {
+    return null;
+  }
+
+  const signingInput = Buffer.from(`${parts[0]}.${parts[1]}`);
+  const signature = base64UrlToBuffer(parts[2]);
+
+  let valid = false;
+
+  try {
+    if (header.alg === "EdDSA") {
+      valid = crypto.verify(null, signingInput, publicKey, signature);
+    } else if (header.alg === "ES256") {
+      valid = crypto.verify(
+        "sha256",
+        signingInput,
+        { key: publicKey, dsaEncoding: "ieee-p1363" },
+        signature,
+      );
+    } else if (header.alg === "RS256") {
+      valid = crypto.verify("RSA-SHA256", signingInput, publicKey, signature);
+    }
+  } catch {
+    return null;
+  }
+
+  if (!valid) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+
+  if (typeof payload.exp === "number" && payload.exp < now) return null;
+  if (typeof payload.nbf === "number" && payload.nbf > now + 60) return null;
+
+  return payload;
+}
+
+function userFromJwtPayload(payload) {
+  const id = payload.sub || payload.id;
+
+  if (!id) return null;
+
+  return {
+    id: String(id),
+    name: payload.name || "ImpactPulse User",
+    email: payload.email || "",
+    image: payload.image || "",
+  };
+}
 
 async function authenticateUser(req, res, next) {
   try {
+    const authorization = req.headers.authorization || "";
+    const bearerToken = authorization.startsWith("Bearer ")
+      ? authorization.slice(7).trim()
+      : "";
+
+    // Preferred path: stateless JWT validation against Better Auth's JWKS.
+    if (bearerToken) {
+      const payload = await verifyJwtToken(bearerToken);
+      const user = payload ? userFromJwtPayload(payload) : null;
+
+      if (!user) {
+        return res.status(401).json({
+          success: false,
+          message: "Your session token is invalid or expired. Please log in again.",
+        });
+      }
+
+      req.user = user;
+      return next();
+    }
+
+    // Fallback: verify the session cookie against Better Auth.
     const cookie = req.headers.cookie;
 
     if (!cookie) {
@@ -322,7 +464,10 @@ app.get("/api/events", async (req, res, next) => {
       Math.max(1, Number.parseInt(req.query.limit, 10) || 9),
     );
 
-    const filter = {};
+    const filter = {
+      // Upcoming Events must never show events whose date has passed.
+      eventDate: { $gte: getTodayDateString() },
+    };
 
     if (search) {
       const safeSearch = escapeRegex(search);
@@ -342,7 +487,7 @@ app.get("/api/events", async (req, res, next) => {
 
     const events = await eventsCollection
       .find(filter)
-      .sort({ createdAt: -1 })
+      .sort({ eventDate: 1, startTime: 1 })
       .skip((page - 1) * limit)
       .limit(limit)
       .toArray();
@@ -613,6 +758,8 @@ app.post("/api/events/:id/join", authenticateUser, async (req, res, next) => {
     const participant = {
       userId: req.user.id,
       name: req.user.name,
+      email: req.user.email,
+      image: req.user.image || "",
       joinedAt: new Date(),
     };
 
